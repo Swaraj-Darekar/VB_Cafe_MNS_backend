@@ -15,6 +15,10 @@ from contextlib import asynccontextmanager
 # Load environment variables from .env
 load_dotenv()
 
+import logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 # --- Lifespan & Keep-Alive ---
 async def ping_server():
     """Background task to ping the server itself to keep it awake on Render."""
@@ -58,6 +62,17 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# --- Global Exception Handler for Debugging ---
+@app.exception_handler(Exception)
+async def global_exception_handler(request, exc):
+    import traceback
+    err_msg = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    logger.error(f"Unhandled Exception: {err_msg}")
+    return UJSONResponse(
+        status_code=500,
+        content={"status": "error", "message": str(exc), "traceback": err_msg}
+    )
 
 # Initialize Supabase Client (singleton — created once at startup)
 url = os.environ.get("SUPABASE_URL")
