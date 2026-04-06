@@ -232,81 +232,77 @@ def create_order(order: OrderCreate):
     if not supabase:
         raise HTTPException(status_code=500, detail="Database connection not initialized")
 
+    # Optimization: Use fixed commission if settings fetch fails, 
+    # but try to fetch them in one go if possible.
     commission_rs = 2.0
-    current_balance = 0.0
-    wallet_id = None
+    current_wallet = {"id": None, "balance": 0.0}
 
-    # --- Single-round-trip: fetch settings + wallet in parallel via two quick selects ---
     try:
-        settings_resp = supabase.table("settings").select("commission_rs").limit(1).execute()
-        if settings_resp.data:
-            commission_rs = float(settings_resp.data[0]['commission_rs'])
+        # Step 1: Parallel-ish fetch using the fact that these are quick SELECTs
+        # In a high-perf environment we'd use asyncio.gather here, 
+        # but even sequential is better if we reduce the number of rows.
+        
+        settings_data = supabase.table("settings").select("commission_rs").limit(1).execute().data
+        if settings_data:
+            commission_rs = float(settings_data[0]['commission_rs'])
 
-        wallet_resp = supabase.table("wallet").select("id, balance").limit(1).execute()
-        if wallet_resp.data:
-            current_balance = float(wallet_resp.data[0]['balance'])
-            wallet_id = wallet_resp.data[0]['id']
+        wallet_data = supabase.table("wallet").select("id, balance").limit(1).execute().data
+        if wallet_data:
+            current_wallet = {"id": wallet_data[0]['id'], "balance": float(wallet_data[0]['balance'])}
         else:
-            init_resp = supabase.table("wallet").insert({"balance": 0.0}).execute()
-            if init_resp.data:
-                wallet_id = init_resp.data[0]['id']
-                current_balance = 0.0
+            # Initialize wallet if it doesn't exist
+            init = supabase.table("wallet").insert({"balance": 0.0}).execute().data
+            if init:
+                current_wallet = {"id": init[0]['id'], "balance": 0.0}
 
-        if current_balance < 10:
-            raise HTTPException(status_code=403, detail="Insufficient wallet balance. Minimum ₹10 required.")
+        if current_wallet["balance"] < 10:
+             raise HTTPException(status_code=403, detail="Insufficient wallet balance. Minimum ₹10 required.")
 
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"WALLET_SYSTEM_ERROR: {e}")
+        # Step 2: Get token number (one quick count)
+        token_no = (supabase.table("orders").select("id", count="exact").execute().count or 0) + 1
 
-    # --- Get sequential token number (count query) ---
-    count_resp = supabase.table("orders").select("id", count="exact").execute()
-    token_no = (count_resp.count or 0) + 1
+        # Step 3: Insert order
+        order_resp = supabase.table("orders").insert({
+            "total_amount": order.total_amount,
+            "payment_mode": order.payment_mode,
+            "discount": order.discount,
+            "is_settled": False,
+            "token_no": token_no
+        }).execute().data
 
-    # --- Insert order + items together ---
-    order_resp = supabase.table("orders").insert({
-        "total_amount": order.total_amount,
-        "payment_mode": order.payment_mode,
-        "discount": order.discount,
-        "is_settled": False,
-        "token_no": token_no
-    }).execute()
+        if not order_resp:
+            raise HTTPException(status_code=400, detail="Failed to create order")
 
-    if not order_resp.data:
-        raise HTTPException(status_code=400, detail="Failed to create order")
+        order_id = order_resp[0]['id']
 
-    order_id = order_resp.data[0]['id']
+        # Step 4: Batch insert items
+        items_to_insert = [
+            {
+                "order_id": order_id,
+                "item_id": item.item_id,
+                "item_name": item.name,
+                "price_at_time": item.price,
+                "qty": item.qty
+            } for item in order.items
+        ]
+        supabase.table("order_items").insert(items_to_insert).execute()
 
-    # Batch insert all order items in one call
-    items_to_insert = [
-        {
+        # Step 5: Update wallet balance
+        new_balance = max(0, current_wallet["balance"] - commission_rs)
+        if current_wallet["id"]:
+            supabase.table("wallet").update({"balance": new_balance}).eq("id", current_wallet["id"]).execute()
+
+        return {
+            "message": "Order created successfully",
             "order_id": order_id,
-            "item_id": item.item_id,
-            "item_name": item.name,
-            "price_at_time": item.price,
-            "qty": item.qty
-        } for item in order.items
-    ]
-    supabase.table("order_items").insert(items_to_insert).execute()
+            "token_no": token_no,
+            "new_balance": new_balance
+        }
 
-    # --- Deduct commission ---
-    new_balance = current_balance
-    if wallet_id:
-        try:
-            new_balance = max(0, current_balance - commission_rs)
-            supabase.table("wallet").update({"balance": new_balance}).eq("id", wallet_id).execute()
-        except Exception as e:
-            print(f"DEDUCTION_FAILED: {e}")
-    else:
-        print("DEDUCTION_SKIPPED: Wallet entry not found.")
-
-    return {
-        "message": "Order created successfully",
-        "order_id": order_id,
-        "token_no": token_no,
-        "new_balance": new_balance
-    }
+    except HTTPException: raise
+    except Exception as e:
+        print(f"ORDER_CREATION_FAILED: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/orders")
 def get_orders():
@@ -406,12 +402,43 @@ def get_analytics_summary():
 
     tz = pytz.timezone('Asia/Kolkata')
     now = datetime.now(tz)
+    
+    # Precise boundaries for DB filtering
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     yesterday_start = today_start - timedelta(days=1)
     month_start = today_start.replace(day=1)
 
-    all_orders = supabase.table("orders").select("total_amount, payment_mode, created_at").eq("is_settled", False).execute().data or []
-    all_expenses = supabase.table("expenses").select("amount, created_at").eq("is_settled", False).execute().data or []
+    # Use ISO strings for filtering
+    today_iso = today_start.isoformat()
+    yesterday_iso = yesterday_start.isoformat()
+    month_iso = month_start.isoformat()
+
+    # Optimization: Only fetch what's needed for the 3 buckets in fewer queries if possible, 
+    # but for now, DB-level filtering on all_orders is better than Python-level.
+    # Actually, let's fetch all UNSETTLED orders but filter by date in the query.
+    
+    # We'll fetch all unsettled orders from the start of the current month.
+    # This is much smaller than ALL unsettled orders if they haven't settled for a long time.
+    try:
+        all_orders = supabase.table("orders") \
+            .select("total_amount, payment_mode, created_at") \
+            .eq("is_settled", False) \
+            .gte("created_at", month_iso) \
+            .execute().data or []
+            
+        all_expenses = supabase.table("expenses") \
+            .select("amount, created_at") \
+            .eq("is_settled", False) \
+            .gte("created_at", month_iso) \
+            .execute().data or []
+            
+        # Also need total unsettled count for "All-Time Bills" which is actually "Unsettled Bills"
+        total_count_resp = supabase.table("orders").select("id", count="exact").eq("is_settled", False).execute()
+        total_unsettled_count = total_count_resp.count or 0
+
+    except Exception as e:
+        print(f"ANALYTICS_QUERY_FAILED: {e}")
+        return {"today": {"count": 0, "total":0}, "yesterday": {"count": 0, "total":0}, "monthly": {"sales": 0, "expenses":0, "profit":0}}
 
     def parse_dt(dt_str):
         return datetime.fromisoformat(dt_str.replace('Z', '+00:00')).astimezone(tz)
@@ -422,21 +449,19 @@ def get_analytics_summary():
         cash = sum(float(o['total_amount']) for o in orders_list if o['payment_mode'] == 'Cash')
         return {"total": total, "online": online, "cash": cash, "count": len(orders_list)}
 
-    today_orders, yesterday_orders, monthly_orders = [], [], []
+    today_orders, yesterday_orders = [], []
+    monthly_sales = 0.0
+    
     for o in all_orders:
         dt = parse_dt(o['created_at'])
+        amount = float(o['total_amount'])
+        monthly_sales += amount
         if dt >= today_start:
             today_orders.append(o)
         elif dt >= yesterday_start:
             yesterday_orders.append(o)
-        if dt >= month_start:
-            monthly_orders.append(o)
 
-    monthly_expenses = sum(
-        float(e['amount']) for e in all_expenses
-        if parse_dt(e['created_at']) >= month_start
-    )
-    monthly_sales = sum(float(o['total_amount']) for o in monthly_orders)
+    monthly_expenses = sum(float(e['amount']) for e in all_expenses)
 
     return {
         "today": get_stats(today_orders),
@@ -444,7 +469,8 @@ def get_analytics_summary():
         "monthly": {
             "sales": monthly_sales,
             "expenses": monthly_expenses,
-            "profit": monthly_sales - monthly_expenses
+            "profit": monthly_sales - monthly_expenses,
+            "count": total_unsettled_count # Using this for the "All-Time" display in SuperAdmin
         }
     }
 
