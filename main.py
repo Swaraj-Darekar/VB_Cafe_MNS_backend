@@ -41,16 +41,14 @@ async def lifespan(app: FastAPI):
     yield
     # Shutdown logic (if any) could go here
 
-# Initialize FastAPI App
+# Initialize FastAPI App with custom lifespan and faster JSON responses
+from fastapi.responses import UJSONResponse
+
 app = FastAPI(
     title="VB Cafe Management System API",
     lifespan=lifespan,
-    default_response_class=lambda **kwargs: HTTPException(500, "Internal Server Error") # Placeholder logic
+    default_response_class=UJSONResponse
 )
-
-# Use ujson for faster serialization
-from fastapi.responses import UJSONResponse
-app.default_response_class = UJSONResponse
 
 # Configure CORS so the React Frontend can communicate with the Python backend
 app.add_middleware(
