@@ -143,7 +143,7 @@ async def login(req: LoginRequest):
         if req.username == "superadmin" and req.password == "superpassword":
             return {"status": "success", "user": "superadmin"}
     else:
-        if req.username == "admin" and req.password == "pass":
+        if req.username == "admin" and req.password == "Ybs123":
             return {"status": "success", "user": "admin"}
             
     raise HTTPException(status_code=401, detail="Invalid credentials")
