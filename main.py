@@ -417,19 +417,17 @@ def get_analytics_summary():
     # but for now, DB-level filtering on all_orders is better than Python-level.
     # Actually, let's fetch all UNSETTLED orders but filter by date in the query.
     
-    # We'll fetch all unsettled orders from the start of the current month.
-    # This is much smaller than ALL unsettled orders if they haven't settled for a long time.
+    # We'll fetch all unsettled orders and expenses.
+    # This allows the "Current Cycle" to span across multiple calendar months until manually settled.
     try:
         all_orders = supabase.table("orders") \
             .select("total_amount, payment_mode, created_at") \
             .eq("is_settled", False) \
-            .gte("created_at", month_iso) \
             .execute().data or []
             
         all_expenses = supabase.table("expenses") \
             .select("amount, created_at") \
             .eq("is_settled", False) \
-            .gte("created_at", month_iso) \
             .execute().data or []
             
         # Also need total unsettled count for "All-Time Bills" which is actually "Unsettled Bills"
